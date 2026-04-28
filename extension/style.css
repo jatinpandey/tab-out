@@ -1280,3 +1280,61 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   font-size: 10px;
   opacity: 0.7;
 }
+
+/* ---- Drag-and-drop reorder for local domain cards ---- */
+.mission-card.domain-card {
+  position: relative; /* anchor the absolute drag-handle */
+}
+.drag-handle {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  cursor: grab;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+  z-index: 2;
+  user-select: none;
+}
+.drag-handle:active {
+  cursor: grabbing;
+}
+.mission-card.domain-card:hover .drag-handle {
+  opacity: 0.55;
+}
+.drag-handle:hover {
+  opacity: 1 !important;
+  background: var(--warm-gray);
+  color: var(--ink);
+}
+.drag-handle svg {
+  width: 16px;
+  height: 16px;
+  pointer-events: none; /* let drag events fire on the handle div, not svg */
+}
+
+.mission-card.dragging {
+  opacity: 0.4;
+  transform: scale(0.98);
+}
+
+/* Insertion line — indicates where the card will land on drop */
+.mission-card.drop-before::before,
+.mission-card.drop-after::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: var(--accent-amber);
+  border-radius: 2px;
+  z-index: 5;
+}
+.mission-card.drop-before::before { top: -6px; }
+.mission-card.drop-after::after   { bottom: -6px; }

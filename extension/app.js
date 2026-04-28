@@ -542,6 +542,59 @@ function defaultLabelForTab(tab) {
 
 let searchQuery = '';
 
+/* ----------------------------------------------------------------
+   DOMAIN ORDER — persisted user-chosen ordering of local domain cards
+
+   Storage shape under "domainOrder":
+   ["github.com", "x.com", "__landing-pages__", ...]
+
+   Domains not in this list fall back to the default sort (landing
+   first, priority sites next, then by tab count). When the user
+   reorders, we save the visible-card order and append any unseen
+   (e.g. filtered-out) domains at the end so their relative ordering
+   isn't lost.
+   ---------------------------------------------------------------- */
+
+let domainOrder = [];
+
+async function loadDomainOrder() {
+  try {
+    const { domainOrder: o = [] } = await chrome.storage.local.get('domainOrder');
+    domainOrder = Array.isArray(o) ? o : [];
+  } catch (err) {
+    console.warn('[tab-out] Failed to load domainOrder:', err);
+    domainOrder = [];
+  }
+}
+
+async function persistDomainOrder() {
+  try {
+    await chrome.storage.local.set({ domainOrder });
+  } catch (err) {
+    console.warn('[tab-out] Failed to save domainOrder:', err);
+  }
+}
+
+/**
+ * applyUserDomainOrder(groups)
+ *
+ * Stable-sorts groups so that any group whose domain is in the user's
+ * persisted order comes first (in that order), and the rest keep their
+ * incoming order (which is already the "natural" sort from
+ * groupTabsByDomain — landing pages first, etc.).
+ */
+function applyUserDomainOrder(groups) {
+  if (!domainOrder || domainOrder.length === 0) return groups;
+  const orderIndex = new Map(domainOrder.map((d, i) => [d, i]));
+  const indexed = groups.map((g, naturalIdx) => ({
+    g,
+    primary:   orderIndex.has(g.domain) ? orderIndex.get(g.domain) : Infinity,
+    secondary: naturalIdx,
+  }));
+  indexed.sort((a, b) => a.primary - b.primary || a.secondary - b.secondary);
+  return indexed.map(x => x.g);
+}
+
 function tabMatchesQuery(tab, q) {
   if (!q) return true;
   const url   = (tab.url || '').toLowerCase();
@@ -1182,9 +1235,22 @@ function renderDomainCard(group, opts = {}) {
 
   const actionsBlock = actionsHtml ? `<div class="actions">${actionsHtml}</div>` : '';
 
+  // Drag handle — only on local cards. Only the handle is draggable so
+  // the rest of the card (chips, buttons, edit-name input) keeps normal
+  // click and text-selection behavior.
+  const dragHandle = remote ? '' : `
+    <div class="drag-handle" draggable="true" title="Drag to reorder" aria-label="Drag to reorder">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor"><circle cx="9" cy="6" r="0.9" fill="currentColor"/><circle cx="15" cy="6" r="0.9" fill="currentColor"/><circle cx="9" cy="12" r="0.9" fill="currentColor"/><circle cx="15" cy="12" r="0.9" fill="currentColor"/><circle cx="9" cy="18" r="0.9" fill="currentColor"/><circle cx="15" cy="18" r="0.9" fill="currentColor"/></svg>
+    </div>`;
+
+  // Encode the actual domain key on the element so the drag handler can
+  // read it back without having to map sanitized IDs.
+  const domainAttr = ` data-domain="${(group.domain || '').replace(/"/g, '&quot;')}"`;
+
   return `
-    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}${remote ? ' remote-card' : ''}" data-domain-id="${stableId}">
+    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}${remote ? ' remote-card' : ''}" data-domain-id="${stableId}"${domainAttr}>
       <div class="status-bar"></div>
+      ${dragHandle}
       <div class="mission-content">
         <div class="mission-top">
           <span class="mission-name">${isLanding ? 'Homepages' : (group.label || friendlyDomain(group.domain))}</span>
@@ -1463,8 +1529,8 @@ async function renderStaticDashboard() {
   if (greetingEl) greetingEl.textContent = getGreeting();
   if (dateEl)     dateEl.textContent     = getDateDisplay();
 
-  // --- Load persisted state (custom names) before any chip render ---
-  await loadSiteNames();
+  // --- Load persisted state (custom names + drag order) before any chip render ---
+  await Promise.all([loadSiteNames(), loadDomainOrder()]);
 
   // --- Fetch tabs (local + synced from other devices) ---
   await fetchOpenTabs();
@@ -1512,7 +1578,7 @@ function renderLocalTabsSection() {
   const realTabs = getRealTabs();
   const q = searchQuery.toLowerCase();
   const filteredTabs = q ? realTabs.filter(t => tabMatchesQuery(t, q)) : realTabs;
-  domainGroups = groupTabsByDomain(filteredTabs);
+  domainGroups = applyUserDomainOrder(groupTabsByDomain(filteredTabs));
 
   if (domainGroups.length > 0) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = q ? 'Open tabs — matches' : 'Open tabs';
@@ -1928,10 +1994,14 @@ function beginChipNameEdit(chip, url, autoLabel) {
   chip.removeAttribute('data-action');
 
   const current = siteNames[url] || '';
+  // Pre-fill with whatever's currently displayed — custom name if set,
+  // otherwise the auto-cleaned label — so the user can edit instead of
+  // typing from scratch.
+  const startValue = current || autoLabel || '';
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'chip-name-input';
-  input.value = current;
+  input.value = startValue;
   input.placeholder = autoLabel || 'Custom name';
   input.maxLength = 80;
   input.setAttribute('aria-label', 'Rename this site');
@@ -1956,13 +2026,17 @@ function beginChipNameEdit(chip, url, autoLabel) {
 
     if (save) {
       const newName = input.value.trim();
-      // Only persist if changed
-      if (newName !== current) {
-        await setSiteName(url, newName);
+      // If the user opened the editor and submits without changes (or
+      // submits a value identical to the auto-label), don't lock the
+      // auto-label in as a "custom" name.
+      const effective = (newName === autoLabel) ? '' : newName;
+
+      if (effective !== current) {
+        await setSiteName(url, effective);
         // Re-render every section so all instances of this URL update
         rerenderTabSections();
         await renderDeferredColumn();
-        showToast(newName ? 'Renamed' : 'Name cleared');
+        showToast(effective ? 'Renamed' : 'Name cleared');
         return; // re-render replaces the chip entirely
       }
     }
@@ -2033,6 +2107,101 @@ function beginChipNameEdit(chip, url, autoLabel) {
       input.focus();
       input.select();
     }
+  });
+})();
+
+
+/* ----------------------------------------------------------------
+   DRAG-AND-DROP REORDER for local domain cards
+
+   Only the .drag-handle inside each local card has draggable=true, so
+   chips and buttons keep normal click/text behavior. On drop we splice
+   the dragged card into the new DOM position, then read back the
+   resulting card order and persist it to chrome.storage.local. The
+   stored order survives sync (it's just a list of domain keys).
+   ---------------------------------------------------------------- */
+
+(function wireDragReorder() {
+  const container = document.getElementById('openTabsMissions');
+  if (!container) return;
+
+  let draggedCard = null;
+
+  const clearDropIndicators = () => {
+    container.querySelectorAll('.drop-before, .drop-after').forEach(el =>
+      el.classList.remove('drop-before', 'drop-after')
+    );
+  };
+
+  // Save the new order from the current DOM. Preserves any domains that
+  // are NOT currently in the DOM (e.g. filtered out by search) by
+  // appending them in their existing relative order.
+  const persistOrderFromDOM = async () => {
+    const cards = container.querySelectorAll('.mission-card.domain-card:not(.remote-card)');
+    const visibleOrder = [];
+    cards.forEach(card => {
+      const d = card.dataset.domain;
+      if (d) visibleOrder.push(d);
+    });
+    const visibleSet = new Set(visibleOrder);
+    const remaining = domainOrder.filter(d => !visibleSet.has(d));
+    domainOrder = [...visibleOrder, ...remaining];
+    await persistDomainOrder();
+  };
+
+  container.addEventListener('dragstart', (e) => {
+    const handle = e.target.closest('.drag-handle');
+    if (!handle) return; // drag from anything other than the handle is ignored
+    const card = handle.closest('.mission-card.domain-card');
+    if (!card || card.classList.contains('remote-card')) return;
+    draggedCard = card;
+    card.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    // setData is required in Firefox for the drag to actually start
+    try { e.dataTransfer.setData('text/plain', card.dataset.domain || ''); } catch {}
+    // Use the whole card (not just the small handle) as the drag image
+    const rect = card.getBoundingClientRect();
+    try { e.dataTransfer.setDragImage(card, e.clientX - rect.left, e.clientY - rect.top); } catch {}
+  });
+
+  container.addEventListener('dragover', (e) => {
+    if (!draggedCard) return;
+    const card = e.target.closest('.mission-card.domain-card');
+    if (!card || card === draggedCard || card.classList.contains('remote-card')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const rect = card.getBoundingClientRect();
+    const before = (e.clientY - rect.top) < rect.height / 2;
+    clearDropIndicators();
+    card.classList.add(before ? 'drop-before' : 'drop-after');
+  });
+
+  container.addEventListener('dragleave', (e) => {
+    // Only clear if leaving the container entirely (not just moving between cards)
+    if (e.relatedTarget && container.contains(e.relatedTarget)) return;
+    clearDropIndicators();
+  });
+
+  container.addEventListener('drop', async (e) => {
+    if (!draggedCard) return;
+    const card = e.target.closest('.mission-card.domain-card');
+    if (!card || card === draggedCard || card.classList.contains('remote-card')) {
+      clearDropIndicators();
+      return;
+    }
+    e.preventDefault();
+    const rect = card.getBoundingClientRect();
+    const before = (e.clientY - rect.top) < rect.height / 2;
+    if (before) container.insertBefore(draggedCard, card);
+    else        container.insertBefore(draggedCard, card.nextSibling);
+    clearDropIndicators();
+    await persistOrderFromDOM();
+  });
+
+  container.addEventListener('dragend', () => {
+    if (draggedCard) draggedCard.classList.remove('dragging');
+    draggedCard = null;
+    clearDropIndicators();
   });
 })();
 
