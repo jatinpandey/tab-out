@@ -337,28 +337,25 @@ async function fetchOtherDeviceTabs() {
 }
 
 /**
- * restoreRemoteSession(sessionId)
+ * restoreRemoteSession(sessionId, url)
  *
- * Reopens a synced tab from another device on THIS device. There is
- * no API to focus the original device; "restore" creates a new local
- * tab pointing at that URL. Falls back to chrome.tabs.create on error.
+ * Opens a synced tab from another device locally. We deliberately do
+ * NOT use chrome.sessions.restore here — when the synced tab came from
+ * a remote window, restore() reconstructs the entire window, spawning
+ * a new Chrome window for a single-tab click. Instead we just create
+ * a normal tab in the current window so it opens inline like any
+ * other "open this URL" action.
+ *
+ * sessionId is accepted for API symmetry but currently unused.
  */
-async function restoreRemoteSession(sessionId, fallbackUrl) {
-  if (sessionId && chrome.sessions && typeof chrome.sessions.restore === 'function') {
-    try {
-      await new Promise((resolve, reject) => {
-        chrome.sessions.restore(sessionId, () => {
-          const err = chrome.runtime.lastError;
-          if (err) reject(err); else resolve();
-        });
-      });
-      return;
-    } catch (err) {
-      console.warn('[tab-out] sessions.restore failed, falling back to create:', err);
-    }
-  }
-  if (fallbackUrl) {
-    try { await chrome.tabs.create({ url: fallbackUrl, active: true }); }
+async function restoreRemoteSession(sessionId, url) {
+  if (!url) return;
+  try {
+    const win = await chrome.windows.getCurrent();
+    await chrome.tabs.create({ url, active: true, windowId: win.id });
+  } catch (err) {
+    console.warn('[tab-out] tabs.create failed, retrying without windowId:', err);
+    try { await chrome.tabs.create({ url, active: true }); }
     catch (e) { console.warn('[tab-out] tabs.create fallback failed:', e); }
   }
 }
