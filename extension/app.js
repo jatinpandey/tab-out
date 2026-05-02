@@ -396,11 +396,13 @@ function deviceIcon(deviceName) {
  */
 function renderDeviceSubsection(device, deviceIndex) {
   const tabs   = device.tabs || [];
-  // Preserve the device's natural tab order (e.g. iPhone manual ordering)
-  // — don't apply the priority/tab-count sort the local section uses.
-  // groupId-tagged tabs still bucket into Chrome group cards; we just
-  // don't have remote group titles, so the renderer falls back to "Tab
-  // group" until the user renames it via the existing pencil.
+  // Domain-group with first-appearance ordering. We deliberately do NOT
+  // pass chromeGroups for remote: Chrome's extension API doesn't expose
+  // remote group metadata, and synced groupIds (especially from iOS) are
+  // unreliable — they often resolve to a single value across all tabs,
+  // which would collapse the whole device into one card. Falling back to
+  // domain grouping with preserveOrder gives the user the iPhone's manual
+  // tab order at the card level + per-domain bucketing within.
   const groups = groupTabsByDomain(tabs, { preserveOrder: true });
 
   const lastSeen = device.lastModified
@@ -1519,13 +1521,20 @@ function matchCustomGroup(url) {
  *   3. Custom group rule — from config.local.js LOCAL_CUSTOM_GROUPS.
  *   4. Hostname          — fallback bucket.
  *
- * opts.chromeGroups  — { [groupId]: { id, title, color, ... } }
- * opts.preserveOrder — when true, return groups in first-appearance
- *                      order (used for remote devices so the user's
- *                      manual tab ordering on the source device shows
- *                      through). When false, apply the dashboard's
- *                      priority sort: Chrome groups → landing → priority
- *                      domains → by tab count.
+ * opts.chromeGroups   — { [groupId]: { id, title, color, ... } }. We
+ *                       only treat a tab's groupId as a real Chrome
+ *                       group when it appears in this map. Without
+ *                       metadata, the value isn't trustworthy (iOS
+ *                       Chrome's synced sessions, in particular, set
+ *                       groupId to a non-(-1) value for every tab,
+ *                       which collapses the whole device into a single
+ *                       bucket if you trust it blindly).
+ * opts.preserveOrder  — when true, return groups in first-appearance
+ *                       order (used for remote devices so the user's
+ *                       manual tab ordering on the source device shows
+ *                       through). When false, apply the dashboard's
+ *                       priority sort: Chrome groups → landing → priority
+ *                       domains → by tab count.
  */
 function groupTabsByDomain(tabs, opts = {}) {
   const chromeGroups   = opts.chromeGroups || {};
@@ -1544,18 +1553,21 @@ function groupTabsByDomain(tabs, opts = {}) {
   for (const tab of tabs) {
     if (!tab.url) continue;
     try {
-      // 1. Chrome tab group — overrides everything else
+      // 1. Chrome tab group — only when the groupId resolves to a real
+      // group we have metadata for. This prevents iOS-synced tabs (whose
+      // groupId is a window-id-like number but never resolves to a known
+      // group) from collapsing into a single bogus bucket.
       const gid = tab.groupId;
-      if (typeof gid === 'number' && gid >= 0) {
+      const cg  = (typeof gid === 'number' && gid >= 0) ? chromeGroups[gid] : null;
+      if (cg) {
         const key = '__cg-' + gid;
-        const cg  = chromeGroups[gid];
         ensureGroup(key, () => ({
           domain: key,
-          label:  (cg && cg.title) ? cg.title : 'Tab group',
+          label:  cg.title || 'Tab group',
           chromeGroup: {
             id:    gid,
-            color: cg && cg.color ? cg.color : null,
-            title: cg && cg.title ? cg.title : null,
+            color: cg.color || null,
+            title: cg.title || null,
           },
           tabs: [],
         })).tabs.push(tab);
