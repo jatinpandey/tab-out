@@ -1338,3 +1338,20 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
 }
 .mission-card.drop-before::before { top: -6px; }
 .mission-card.drop-after::after   { bottom: -6px; }
+
+/* ---- Chrome tab group cards ---- */
+.chrome-group-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: 1px;
+  background: #9aa0a6;
+  flex-shrink: 0;
+}
+/* Replace the neutral status bar with the Chrome group's color, when set */
+.mission-card.chrome-group-card .status-bar {
+  background: var(--chrome-group-color, var(--accent-slate)) !important;
+  opacity: 0.85;
+}

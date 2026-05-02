@@ -25,12 +25,34 @@
 
 // All open tabs — populated by fetchOpenTabs()
 let openTabs = [];
+// Map of local Chrome tab groups keyed by group id: { 17: { id, title, color, ... } }
+let localChromeGroups = {};
+
+// Chrome's named tab-group colors → display hex. Approximations of Chrome
+// desktop's Material colors so cards visually match the live tab strip.
+const CHROME_GROUP_COLORS = {
+  grey:   '#9aa0a6',
+  blue:   '#1a73e8',
+  red:    '#d93025',
+  yellow: '#f9ab00',
+  green:  '#188038',
+  pink:   '#d01884',
+  purple: '#9334e6',
+  cyan:   '#007b83',
+  orange: '#fa903e',
+};
+
+function chromeGroupColorHex(name) {
+  return CHROME_GROUP_COLORS[name] || '#9aa0a6';
+}
 
 /**
  * fetchOpenTabs()
  *
- * Reads all currently open browser tabs directly from Chrome.
- * Sets the extensionId flag so we can identify Tab Out's own pages.
+ * Reads all currently open browser tabs directly from Chrome, plus any
+ * Chrome tab groups so we can render real groups (titles + colors)
+ * instead of just hostname-based buckets. Sets the extensionId flag so
+ * we can identify Tab Out's own pages.
  */
 async function fetchOpenTabs() {
   try {
@@ -45,12 +67,26 @@ async function fetchOpenTabs() {
       title:    t.title,
       windowId: t.windowId,
       active:   t.active,
+      groupId:  (typeof t.groupId === 'number') ? t.groupId : -1,
+      index:    t.index,
       // Flag Tab Out's own pages so we can detect duplicate new tabs
       isTabOut: t.url === newtabUrl || t.url === 'chrome://newtab/',
     }));
   } catch {
     // chrome.tabs API unavailable (shouldn't happen in an extension page)
     openTabs = [];
+  }
+
+  // Local Chrome tab groups (titles + colors). Best-effort: not present
+  // on older Chrome or if the permission isn't granted yet.
+  localChromeGroups = {};
+  if (chrome.tabGroups && typeof chrome.tabGroups.query === 'function') {
+    try {
+      const groups = await chrome.tabGroups.query({});
+      for (const g of groups) localChromeGroups[g.id] = g;
+    } catch (err) {
+      console.warn('[tab-out] tabGroups.query failed:', err);
+    }
   }
 }
 
@@ -269,12 +305,19 @@ async function fetchOtherDeviceTabs() {
           url.startsWith('edge://') ||
           url.startsWith('brave://')
         ) continue;
+        // Dedupe by URL but keep first occurrence — preserves the natural
+        // ordering of tabs on the remote device (e.g. iPhone manual order).
         if (seenUrls.has(url)) continue;
         seenUrls.add(url);
         tabs.push({
           url,
           title:     t.title || url,
           sessionId: t.sessionId,
+          // Synced tabs include groupId on Chromium (may be -1 / undefined
+          // on iOS-synced sessions). When present, we use it to bucket
+          // tabs into the same Chrome group across devices.
+          groupId:   (typeof t.groupId === 'number') ? t.groupId : -1,
+          index:     t.index,
         });
       }
     }
@@ -353,7 +396,12 @@ function deviceIcon(deviceName) {
  */
 function renderDeviceSubsection(device, deviceIndex) {
   const tabs   = device.tabs || [];
-  const groups = groupTabsByDomain(tabs);
+  // Preserve the device's natural tab order (e.g. iPhone manual ordering)
+  // — don't apply the priority/tab-count sort the local section uses.
+  // groupId-tagged tabs still bucket into Chrome group cards; we just
+  // don't have remote group titles, so the renderer falls back to "Tab
+  // group" until the user renames it via the existing pencil.
+  const groups = groupTabsByDomain(tabs, { preserveOrder: true });
 
   const lastSeen = device.lastModified
     ? `last active ${timeAgo(new Date(device.lastModified * 1000).toISOString())}`
@@ -1247,13 +1295,29 @@ function renderDomainCard(group, opts = {}) {
   // read it back without having to map sanitized IDs.
   const domainAttr = ` data-domain="${(group.domain || '').replace(/"/g, '&quot;')}"`;
 
+  // Chrome tab group visuals: colored dot + (optional) inline style for
+  // the card's status bar so the card visually matches the live tab strip.
+  const isChromeGroup = group.chromeGroup && typeof group.chromeGroup.id === 'number';
+  const cgHex = isChromeGroup && group.chromeGroup.color
+    ? chromeGroupColorHex(group.chromeGroup.color)
+    : '';
+  const cgDot = isChromeGroup
+    ? `<span class="chrome-group-dot" style="${cgHex ? `background:${cgHex}` : ''}" title="Chrome tab group"></span>`
+    : '';
+  const titleText = isChromeGroup
+    ? (group.label || 'Tab group')
+    : (isLanding ? 'Homepages' : (group.label || friendlyDomain(group.domain)));
+  const cardStatusBarStyle = (isChromeGroup && cgHex)
+    ? ` style="--chrome-group-color:${cgHex};"`
+    : '';
+
   return `
-    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}${remote ? ' remote-card' : ''}" data-domain-id="${stableId}"${domainAttr}>
+    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}${remote ? ' remote-card' : ''}${isChromeGroup ? ' chrome-group-card' : ''}" data-domain-id="${stableId}"${domainAttr}${cardStatusBarStyle}>
       <div class="status-bar"></div>
       ${dragHandle}
       <div class="mission-content">
         <div class="mission-top">
-          <span class="mission-name">${isLanding ? 'Homepages' : (group.label || friendlyDomain(group.domain))}</span>
+          <span class="mission-name">${cgDot}${titleText}</span>
           ${tabBadge}
           ${dupeBadge}
         </div>
@@ -1442,58 +1506,113 @@ function matchCustomGroup(url) {
 }
 
 /**
- * groupTabsByDomain(tabs)
+ * groupTabsByDomain(tabs, opts)
  *
  * Pure helper used for both local tabs and synced remote-device tabs.
- * Same logic the dashboard has always used: pull landing pages into a
- * special group, honor custom groups from config.local.js, otherwise
- * group by hostname. Returns a sorted array of groups.
+ *
+ * Bucket priority (highest first):
+ *   1. Chrome tab group  — tab.groupId is a real group id and we treat it
+ *      as the dominant grouping signal. Title + color come from
+ *      opts.chromeGroups when available (local), otherwise we synthesize
+ *      a placeholder ("Tab group") that the user can rename.
+ *   2. Landing page      — Gmail inbox, X /home, GitHub /, etc.
+ *   3. Custom group rule — from config.local.js LOCAL_CUSTOM_GROUPS.
+ *   4. Hostname          — fallback bucket.
+ *
+ * opts.chromeGroups  — { [groupId]: { id, title, color, ... } }
+ * opts.preserveOrder — when true, return groups in first-appearance
+ *                      order (used for remote devices so the user's
+ *                      manual tab ordering on the source device shows
+ *                      through). When false, apply the dashboard's
+ *                      priority sort: Chrome groups → landing → priority
+ *                      domains → by tab count.
  */
-function groupTabsByDomain(tabs) {
-  const groupMap    = {};
-  const landingTabs = [];
+function groupTabsByDomain(tabs, opts = {}) {
+  const chromeGroups   = opts.chromeGroups || {};
+  const preserveOrder  = !!opts.preserveOrder;
+  const groupMap       = {};
+  const insertionOrder = [];
+
+  const ensureGroup = (key, factory) => {
+    if (!groupMap[key]) {
+      groupMap[key] = factory();
+      insertionOrder.push(key);
+    }
+    return groupMap[key];
+  };
 
   for (const tab of tabs) {
     if (!tab.url) continue;
     try {
-      if (isLandingPage(tab.url)) {
-        landingTabs.push(tab);
+      // 1. Chrome tab group — overrides everything else
+      const gid = tab.groupId;
+      if (typeof gid === 'number' && gid >= 0) {
+        const key = '__cg-' + gid;
+        const cg  = chromeGroups[gid];
+        ensureGroup(key, () => ({
+          domain: key,
+          label:  (cg && cg.title) ? cg.title : 'Tab group',
+          chromeGroup: {
+            id:    gid,
+            color: cg && cg.color ? cg.color : null,
+            title: cg && cg.title ? cg.title : null,
+          },
+          tabs: [],
+        })).tabs.push(tab);
         continue;
       }
 
+      // 2. Landing page bucket
+      if (isLandingPage(tab.url)) {
+        ensureGroup('__landing-pages__', () => ({
+          domain: '__landing-pages__',
+          tabs:   [],
+        })).tabs.push(tab);
+        continue;
+      }
+
+      // 3. Custom group rule
       const customRule = matchCustomGroup(tab.url);
       if (customRule) {
         const key = customRule.groupKey;
-        if (!groupMap[key]) groupMap[key] = { domain: key, label: customRule.groupLabel, tabs: [] };
-        groupMap[key].tabs.push(tab);
+        ensureGroup(key, () => ({
+          domain: key,
+          label:  customRule.groupLabel,
+          tabs:   [],
+        })).tabs.push(tab);
         continue;
       }
 
-      let hostname;
-      if (tab.url.startsWith('file://')) {
-        hostname = 'local-files';
-      } else {
-        hostname = new URL(tab.url).hostname;
-      }
+      // 4. Hostname fallback
+      const hostname = tab.url.startsWith('file://')
+        ? 'local-files'
+        : new URL(tab.url).hostname;
       if (!hostname) continue;
 
-      if (!groupMap[hostname]) groupMap[hostname] = { domain: hostname, tabs: [] };
-      groupMap[hostname].tabs.push(tab);
+      ensureGroup(hostname, () => ({ domain: hostname, tabs: [] })).tabs.push(tab);
     } catch {
       // skip malformed URLs
     }
   }
 
-  if (landingTabs.length > 0) {
-    groupMap['__landing-pages__'] = { domain: '__landing-pages__', tabs: landingTabs };
+  let groups = insertionOrder.map(k => groupMap[k]);
+
+  if (preserveOrder) {
+    return groups; // first-appearance order — preserves remote device's manual ordering
   }
 
   const landingHostnames = new Set(LANDING_PAGE_PATTERNS.map(p => p.hostname).filter(Boolean));
   const landingSuffixes  = LANDING_PAGE_PATTERNS.map(p => p.hostnameEndsWith).filter(Boolean);
   const isLandingDomain  = (domain) =>
     landingHostnames.has(domain) || landingSuffixes.some(s => domain.endsWith(s));
+  const isChromeGroupKey = (k) => typeof k === 'string' && k.startsWith('__cg-');
 
-  return Object.values(groupMap).sort((a, b) => {
+  return groups.sort((a, b) => {
+    // Real Chrome groups always come first — they're explicit user intent.
+    const aCG = isChromeGroupKey(a.domain);
+    const bCG = isChromeGroupKey(b.domain);
+    if (aCG !== bCG) return aCG ? -1 : 1;
+
     const aIsLanding = a.domain === '__landing-pages__';
     const bIsLanding = b.domain === '__landing-pages__';
     if (aIsLanding !== bIsLanding) return aIsLanding ? -1 : 1;
@@ -1578,7 +1697,9 @@ function renderLocalTabsSection() {
   const realTabs = getRealTabs();
   const q = searchQuery.toLowerCase();
   const filteredTabs = q ? realTabs.filter(t => tabMatchesQuery(t, q)) : realTabs;
-  domainGroups = applyUserDomainOrder(groupTabsByDomain(filteredTabs));
+  domainGroups = applyUserDomainOrder(
+    groupTabsByDomain(filteredTabs, { chromeGroups: localChromeGroups })
+  );
 
   if (domainGroups.length > 0) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = q ? 'Open tabs — matches' : 'Open tabs';
@@ -1844,15 +1965,22 @@ document.addEventListener('click', async (e) => {
     });
     if (!group) return;
 
-    const urls      = group.tabs.map(t => t.url);
-    // Landing pages and custom groups (whose domain key isn't a real hostname)
-    // must use exact URL matching to avoid closing unrelated tabs
-    const useExact  = group.domain === '__landing-pages__' || !!group.label;
+    const urls = group.tabs.map(t => t.url);
 
-    if (useExact) {
-      await closeTabsExact(urls);
+    // Prefer closing by real tab IDs when we have them — that's exact and
+    // handles Chrome groups (whose tabs span many domains) correctly. Fall
+    // back to URL matching for legacy paths where IDs aren't carried.
+    const ids = group.tabs.map(t => t.id).filter(id => typeof id === 'number');
+
+    if (ids.length > 0) {
+      try { await chrome.tabs.remove(ids); } catch (err) { console.warn('[tab-out] tabs.remove failed:', err); }
+      await fetchOpenTabs();
     } else {
-      await closeTabsByUrls(urls);
+      // Landing pages and custom groups (whose domain key isn't a real hostname)
+      // must use exact URL matching to avoid closing unrelated tabs
+      const useExact = group.domain === '__landing-pages__' || !!group.label;
+      if (useExact) await closeTabsExact(urls);
+      else          await closeTabsByUrls(urls);
     }
 
     if (card) {
